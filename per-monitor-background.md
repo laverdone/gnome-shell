@@ -45,7 +45,7 @@ managing per-monitor wallpapers.
 ### Build and install GNOME Shell
 
 ```bash
-cd /home/gianluca/Documenti/Progetti/gnome-shell
+cd gnome-shell
 
 # Remove old build directory if needed
 rm -rf builddir
