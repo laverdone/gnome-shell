@@ -136,6 +136,15 @@
     <child name="window-switcher" schema="org.gnome.shell.window-switcher"/>
     <child name="world-clocks" schema="org.gnome.shell.world-clocks"/>
     <child name="weather" schema="org.gnome.shell.weather"/>
+    <key name="per-monitor-background" type="a{ss}">
+      <default>{}</default>
+      <summary>Per-monitor background URIs</summary>
+      <description>
+        Mapping from monitor connector name to background image URI.
+        When set, the specified monitor will use the given image
+        as background instead of the global background setting.
+      </description>
+    </key>
   </schema>
 
   <schema id="org.gnome.shell.keybindings" path="/org/gnome/shell/keybindings/"

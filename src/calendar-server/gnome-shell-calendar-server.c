@@ -116,7 +116,7 @@ static gboolean
 get_time_from_property (ECalClient            *cal,
                         ICalComponent         *icomp,
                         ICalPropertyKind       prop_kind,
-                        ICalTime * (* get_prop_func) (ICalProperty *prop),
+                         ICalTime * (* get_prop_func) (const ICalProperty *prop),
                         ICalTimezone          *default_zone,
                         ICalTime              **out_itt,
                         ICalTimezone          **out_timezone)

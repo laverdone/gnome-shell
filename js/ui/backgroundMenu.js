@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import St from 'gi://St';
 
 import * as BoxPointer from './boxpointer.js';
@@ -11,6 +12,17 @@ export class BackgroundMenu extends PopupMenu.PopupMenu {
         super(layoutManager.dummyCursor, 0, St.Side.TOP);
 
         this.addSettingsAction(_('Change Background…'), 'gnome-background-panel.desktop');
+        this.addAction(_('Per-Monitor Backgrounds…'), () => {
+            try {
+                const scriptPath = GLib.build_filenamev([
+                    GLib.get_home_dir(), '.local', 'bin',
+                    'gnome-per-monitor-background',
+                ]);
+                GLib.spawn_command_line_async(scriptPath);
+            } catch (e) {
+                logError(e, 'Failed to launch per-monitor background tool');
+            }
+        });
         this.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.addSettingsAction(_('Display Settings'), 'gnome-display-panel.desktop');
         this.addSettingsAction(_('Settings'), 'org.gnome.Settings.desktop');

@@ -117,6 +117,7 @@ const PICTURE_URI_KEY = 'picture-uri';
 const PICTURE_URI_DARK_KEY = 'picture-uri-dark';
 
 const INTERFACE_SCHEMA = 'org.gnome.desktop.interface';
+const SHELL_SCHEMA = 'org.gnome.shell';
 const COLOR_SCHEME_KEY = 'color-scheme';
 
 export const FADE_ANIMATION_TIME = 1000;
@@ -560,13 +561,69 @@ class BackgroundSource {
                 this._onMonitorsChanged.bind(this));
 
         this._interfaceSettings = new Gio.Settings({schema_id: INTERFACE_SCHEMA});
+
+        this._shellSettings = new Gio.Settings({schema_id: SHELL_SCHEMA});
+        this._perMonitorChangedId = this._shellSettings.connect(
+            'changed::per-monitor-background',
+            this._onPerMonitorBackgroundChanged.bind(this));
+    }
+
+    _onPerMonitorBackgroundChanged() {
+        const backgrounds = Object.values(this._backgrounds);
+        for (const background of backgrounds) {
+            if (!background)
+                continue;
+            background._emitChangedSignal();
+        }
+    }
+
+    _getMonitorConnector(monitorIndex) {
+        try {
+            const monitorManager = global.backend.get_monitor_manager();
+            const logicalMonitors = monitorManager.get_logical_monitors();
+            const logicalMonitor = logicalMonitors.find(lm => lm.get_number() === monitorIndex);
+            if (!logicalMonitor)
+                return null;
+            const monitors = logicalMonitor.get_monitors();
+            if (!monitors || monitors.length === 0)
+                return null;
+            return monitors[0].get_connector();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    _getPerMonitorUri(monitorIndex) {
+        try {
+            const settings = new Gio.Settings({schema_id: 'org.gnome.shell'});
+            const perMonitorVariant = settings.get_value('per-monitor-background');
+            if (!perMonitorVariant)
+                return null;
+
+            const dict = perMonitorVariant.recursiveUnpack();
+            if (!dict || typeof dict !== 'object')
+                return null;
+
+            const connector = this._getMonitorConnector(monitorIndex);
+            if (connector && connector in dict)
+                return dict[connector];
+            return null;
+        } catch {
+            return null;
+        }
     }
 
     _onMonitorsChanged() {
+        const nMonitors = this._layoutManager.monitors.length;
+
         for (const monitorIndex in this._backgrounds) {
+            const index = parseInt(monitorIndex, 10);
+            if (index < 0)
+                continue;
+
             const background = this._backgrounds[monitorIndex];
 
-            if (monitorIndex < this._layoutManager.monitors.length) {
+            if (index < nMonitors) {
                 background.updateResolution();
             } else {
                 background.disconnect(background._changedId);
@@ -577,6 +634,30 @@ class BackgroundSource {
     }
 
     getBackground(monitorIndex) {
+        // Check for per-monitor override first
+        const perMonitorUri = this._getPerMonitorUri(monitorIndex);
+        if (perMonitorUri) {
+            if (!(monitorIndex in this._backgrounds)) {
+                const background = new Background({
+                    monitorIndex,
+                    layoutManager: this._layoutManager,
+                    settings: this._settings,
+                    file: Gio.File.new_for_commandline_arg(perMonitorUri),
+                    style: this._settings.get_enum(BACKGROUND_STYLE_KEY),
+                });
+
+                background._changedId = background.connect('bg-changed', () => {
+                    background.disconnect(background._changedId);
+                    background.destroy();
+                    delete this._backgrounds[monitorIndex];
+                });
+
+                this._backgrounds[monitorIndex] = background;
+            }
+            return this._backgrounds[monitorIndex];
+        }
+
+        // No per-monitor override, use shared/global background
         let file = null;
         let style;
 
@@ -600,12 +681,17 @@ class BackgroundSource {
             }
         }
 
+        // Use a reserved key (-1) for the shared background
+        // This prevents conflict with per-monitor backgrounds
+        // that may use the same numeric index
+        const sharedIndex = -1;
+
         // Animated backgrounds are (potentially) per-monitor, since
         // they can have variants that depend on the aspect ratio and
         // size of the monitor; for other backgrounds we can use the
         // same background object for all monitors.
         if (file == null || !file.get_basename().endsWith('.xml'))
-            monitorIndex = 0;
+            monitorIndex = sharedIndex;
 
         if (!(monitorIndex in this._backgrounds)) {
             const background = new Background({
@@ -836,4 +922,74 @@ export class BackgroundManager extends Signals.EventEmitter {
 
         return backgroundActor;
     }
+}
+
+/**
+ * Get the current per-monitor background configuration.
+ *
+ * @returns {Object} A dictionary mapping monitor connector names to URIs
+ */
+export function getPerMonitorBackgrounds() {
+    const settings = new Gio.Settings({schema_id: 'org.gnome.shell'});
+    const variant = settings.get_value('per-monitor-background');
+    return variant ? variant.recursiveUnpack() : {};
+}
+
+/**
+ * Set a per-monitor background for the given connector.
+ * Accepts both file:// URIs and plain file paths.
+ *
+ * @param {string} connector - The monitor connector name (e.g. "DP-1", "eDP-1")
+ * @param {string} uriOrPath - The background image URI or file path
+ */
+export function setPerMonitorBackground(connector, uriOrPath) {
+    const uri = uriOrPath.startsWith('file://') || uriOrPath.startsWith('http')
+        ? uriOrPath
+        : Gio.File.new_for_path(uriOrPath).get_uri();
+    const settings = new Gio.Settings({schema_id: 'org.gnome.shell'});
+    const dict = getPerMonitorBackgrounds();
+    dict[connector] = uri;
+    const variant = new GLib.Variant('a{ss}', dict);
+    settings.set_value('per-monitor-background', variant);
+}
+
+/**
+ * Clear the per-monitor background override for the given connector.
+ *
+ * @param {string} connector - The monitor connector name
+ */
+export function clearPerMonitorBackground(connector) {
+    const settings = new Gio.Settings({schema_id: 'org.gnome.shell'});
+    const dict = getPerMonitorBackgrounds();
+    delete dict[connector];
+    const variant = new GLib.Variant('a{ss}', dict);
+    settings.set_value('per-monitor-background', variant);
+}
+
+/**
+ * Clear all per-monitor background overrides.
+ */
+export function clearAllPerMonitorBackgrounds() {
+    const settings = new Gio.Settings({schema_id: 'org.gnome.shell'});
+    const variant = new GLib.Variant('a{ss}', {});
+    settings.set_value('per-monitor-background', variant);
+}
+
+/**
+ * Get a list of all connected monitors with their connector names.
+ *
+ * @returns {Array<{index: number, connector: string, displayName: string}>}
+ */
+export function getMonitorConnectors() {
+    const monitorManager = global.backend.get_monitor_manager();
+    const logicalMonitors = monitorManager.get_logical_monitors();
+    return logicalMonitors.map(lm => {
+        const monitors = lm.get_monitors();
+        const monitor = monitors && monitors.length > 0 ? monitors[0] : null;
+        return {
+            index: lm.get_number(),
+            connector: monitor ? monitor.get_connector() : null,
+            displayName: monitor ? monitor.get_display_name() : null,
+        };
+    }).filter(m => m.connector);
 }
