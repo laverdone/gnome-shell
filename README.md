@@ -1,3 +1,8 @@
+# Per-Monitor Background Support for GNOME Shell
+
+Details: [Per Monitor Wallpaper](https://github.com/laverdone/gnome-shell/blob/per-monitor-backgroud/per-monitor-background.md)
+
+
 # GNOME Shell
 
 GNOME Shell provides core user interface functions for the GNOME desktop,
