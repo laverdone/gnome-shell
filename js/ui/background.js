@@ -554,6 +554,7 @@ class BackgroundSource {
         this._overrideImage = GLib.getenv('SHELL_BACKGROUND_IMAGE');
         this._settings = new Gio.Settings({schema_id: settingsSchema});
         this._backgrounds = [];
+        this._backgroundConnectors = {};
 
         const monitorManager = global.backend.get_monitor_manager();
         this._monitorsChangedId =
@@ -623,13 +624,27 @@ class BackgroundSource {
 
             const background = this._backgrounds[monitorIndex];
 
-            if (index < nMonitors) {
-                background.updateResolution();
-            } else {
+            if (index >= nMonitors) {
                 background.disconnect(background._changedId);
                 background.destroy();
                 delete this._backgrounds[monitorIndex];
+                delete this._backgroundConnectors[monitorIndex];
+                continue;
             }
+
+            // Check if the connector at this index changed (e.g. lid closed,
+            // causing a different monitor to take this index)
+            const connector = this._getMonitorConnector(index);
+            const oldConnector = this._backgroundConnectors[monitorIndex];
+            if (connector !== oldConnector) {
+                background.disconnect(background._changedId);
+                background.destroy();
+                delete this._backgrounds[monitorIndex];
+                delete this._backgroundConnectors[monitorIndex];
+                continue;
+            }
+
+            background.updateResolution();
         }
     }
 
@@ -638,6 +653,10 @@ class BackgroundSource {
         const perMonitorUri = this._getPerMonitorUri(monitorIndex);
         if (perMonitorUri) {
             if (!(monitorIndex in this._backgrounds)) {
+                const connector = this._getMonitorConnector(monitorIndex);
+                if (connector)
+                    this._backgroundConnectors[monitorIndex] = connector;
+
                 const background = new Background({
                     monitorIndex,
                     layoutManager: this._layoutManager,
@@ -650,6 +669,7 @@ class BackgroundSource {
                     background.disconnect(background._changedId);
                     background.destroy();
                     delete this._backgrounds[monitorIndex];
+                    delete this._backgroundConnectors[monitorIndex];
                 });
 
                 this._backgrounds[monitorIndex] = background;
