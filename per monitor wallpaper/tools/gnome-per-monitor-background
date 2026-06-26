@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import hashlib
+from urllib.parse import urlparse
+
+import gi
+gi.require_version('Gio', '2.0')
+gi.require_version('GLib', '2.0')
+gi.require_version('GObject', '2.0')
+gi.require_version('GdkPixbuf', '2.0')
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+from gi.repository import Gio, GLib, GObject, GdkPixbuf, Gdk, Gtk, Adw
+
+WALLPAPER_DIRS = [
+    '/usr/share/backgrounds',
+    os.path.expanduser('~/.local/share/backgrounds'),
+    os.path.expanduser('~/Immagini/Sfondi'),
+    os.path.expanduser('~/Pictures/Wallpapers'),
+]
+
+
+def get_monitor_connectors():
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        try:
+            result = bus.call_sync(
+                'org.gnome.Mutter.DisplayConfig',
+                '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig',
+                'GetCurrentState',
+                None, None,
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            if result:
+                serial, monitors, logical_monitors, properties = result.unpack()
+                connectors = []
+                seen = set()
+                for monitor in monitors:
+                    connector_info = monitor[0]
+                    connector = connector_info[0]
+                    if connector and connector not in seen:
+                        seen.add(connector)
+                        display_name = connector_info[2] or connector
+                        connectors.append((connector, display_name))
+                return connectors
+        except Exception as e:
+            print(f'GetCurrentState failed: {e}', file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f'Error connecting to session bus: {e}', file=sys.stderr)
+        return []
+
+
+def get_per_monitor_settings():
+    try:
+        settings = Gio.Settings.new('org.gnome.shell')
+        variant = settings.get_value('per-monitor-background')
+        if variant:
+            return variant.unpack()
+        return {}
+    except Exception as e:
+        print(f'Error reading settings: {e}', file=sys.stderr)
+        return {}
+
+
+def set_per_monitor_settings(settings_dict):
+    try:
+        settings = Gio.Settings.new('org.gnome.shell')
+        variant = GLib.Variant('a{ss}', settings_dict)
+        settings.set_value('per-monitor-background', variant)
+        settings.sync()
+    except Exception as e:
+        print(f'Error writing settings: {e}', file=sys.stderr)
+
+
+def discover_wallpapers():
+    wallpapers = []
+    seen = set()
+    for d in WALLPAPER_DIRS:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for root, dirs, files in os.walk(d):
+                for f in sorted(files):
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp')):
+                        path = os.path.join(root, f)
+                        real = os.path.realpath(path)
+                        if real not in seen:
+                            seen.add(real)
+                            wallpapers.append(real)
+        except Exception:
+            pass
+    return wallpapers
+
+
+def get_thumbnail_cache_path(path):
+    uri = 'file://' + os.path.realpath(path)
+    md5 = hashlib.md5(uri.encode()).hexdigest()
+    cache_path = os.path.expanduser(f'~/.cache/thumbnails/large/{md5}.png')
+    if os.path.isfile(cache_path):
+        return cache_path
+    return None
+
+
+def make_thumbnail(path, size=120):
+    cache_path = get_thumbnail_cache_path(path)
+    if cache_path:
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_path, size, int(size * 1), True)
+        except Exception:
+            pass
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size, int(size * 1), True)
+    except Exception:
+        return None
+
+
+class PerMonitorBackgroundApp(Adw.Application):
+    def __init__(self):
+        super().__init__(
+            application_id='org.gnome.Shell.PerMonitorBackground',
+            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+        )
+
+    def do_activate(self):
+        win = PerMonitorBackgroundWindow(self)
+        win.present()
+
+
+class PerMonitorBackgroundWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(
+            application=app,
+            title='Sfondo Display',
+            default_width=680,
+            default_height=620,
+        )
+
+        self._connectors = get_monitor_connectors()
+        self._settings = get_per_monitor_settings()
+        self._selected_connector = self._connectors[0][0] if self._connectors else None
+        self._multi_monitor = len(self._connectors) > 1
+        self._apply_all = False
+        self._wallpapers = []
+        self._thumbnail_queue = []
+        self._thumbnails_loaded = False
+
+        self._build_ui()
+
+    def _build_ui(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_content(box)
+
+        header = Adw.HeaderBar()
+        box.append(header)
+
+        if not self._connectors:
+            status = Adw.StatusPage(
+                title='Nessun monitor trovato',
+                description='Impossibile rilevare monitor collegati.',
+                vexpand=True,
+            )
+            box.append(status)
+            return
+
+        scrolled = Gtk.ScrolledWindow(vexpand=True)
+        box.append(scrolled)
+
+        page = Adw.PreferencesPage()
+        scrolled.set_child(page)
+
+        # --- Group: Seleziona Display ---
+        display_group = Adw.PreferencesGroup(title='Seleziona Display')
+
+        if self._multi_monitor:
+            monitor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            monitor_box.set_margin_top(6)
+            monitor_box.set_margin_bottom(6)
+            monitor_box.set_margin_start(12)
+            monitor_box.set_margin_end(12)
+
+            label = Gtk.Label(
+                label='Scegli il display da configurare:',
+                halign=Gtk.Align.START,
+                css_classes=['caption'],
+            )
+            monitor_box.append(label)
+
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+            btn_box.set_halign(Gtk.Align.CENTER)
+            monitor_box.append(btn_box)
+
+            self._monitor_btns = []
+            self._monitor_group = None
+            for connector, display_name in self._connectors:
+                btn = Gtk.ToggleButton()
+                if self._monitor_group:
+                    btn.set_group(self._monitor_group)
+                else:
+                    self._monitor_group = btn
+                    btn.set_active(True)
+
+                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                vbox.set_margin_top(8)
+                vbox.set_margin_bottom(8)
+                vbox.set_margin_start(12)
+                vbox.set_margin_end(12)
+
+                icon = Gtk.Image(icon_name='video-display-symbolic', pixel_size=32)
+                vbox.append(icon)
+
+                conn_label = Gtk.Label(label=connector, css_classes=['caption'])
+                vbox.append(conn_label)
+
+                btn.set_child(vbox)
+                btn.connect('toggled', self._on_monitor_toggled, connector)
+
+                self._monitor_btns.append(btn)
+                btn_box.append(btn)
+
+            display_group.add(monitor_box)
+
+        switch_row = Adw.SwitchRow(
+            title='Applica a tutti i monitor',
+            subtitle='Usa lo stesso sfondo per ogni display',
+            active=False,
+        )
+        switch_row.connect('notify::active', self._on_apply_all_toggled)
+        display_group.add(switch_row)
+        self._apply_all_switch = switch_row
+
+        page.add(display_group)
+
+        # --- Group: Sfondi ---
+        wall_group = Adw.PreferencesGroup(title='Sfondi')
+        page.add(wall_group)
+
+        flowbox = Gtk.FlowBox(
+            homogeneous=True,
+            min_children_per_line=3,
+            max_children_per_line=6,
+            selection_mode=Gtk.SelectionMode.NONE,
+            column_spacing=8,
+            row_spacing=8,
+            margin_top=6,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        wall_group.add(flowbox)
+
+        self._flowbox = flowbox
+        self._wallpaper_btns = {}
+        self._pending_custom_btn = None
+
+        css = b'button.wallpaper-button { padding: 0; min-width: 0; min-height: 0; }'
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            self.get_display(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        wallpapers = discover_wallpapers()
+        if not wallpapers:
+            placeholder = Gtk.Label(
+                label='Nessuno sfondo trovato.\nAggiungi immagini in ~/.local/share/backgrounds/',
+                halign=Gtk.Align.CENTER,
+                valign=Gtk.Align.CENTER,
+            )
+            flowbox.append(placeholder)
+            self._add_custom_button_to_flowbox()
+            self._thumbnails_loaded = True
+            return
+
+        # Loading indicator while thumbnails load asynchronously
+        loading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        loading_box.set_halign(Gtk.Align.CENTER)
+        loading_box.set_valign(Gtk.Align.CENTER)
+        loading_box.set_margin_top(24)
+        loading_box.set_margin_bottom(24)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        loading_box.append(spinner)
+        loading_label = Gtk.Label(label='Caricamento anteprime…')
+        loading_box.append(loading_label)
+        flowbox.append(loading_box)
+        self._loading_box = loading_box
+
+        self._thumbnail_queue = list(wallpapers)
+        GLib.idle_add(self._load_next_thumbnail, priority=GLib.PRIORITY_LOW)
+
+    def _load_next_thumbnail(self):
+        if not self._thumbnail_queue:
+            if self._loading_box:
+                self._flowbox.remove(self._loading_box)
+                self._loading_box = None
+            self._add_custom_button_to_flowbox()
+            self._thumbnails_loaded = True
+            self._update_selection_indicators()
+            return False
+
+        path = self._thumbnail_queue.pop(0)
+
+        # Add placeholder spinner so the grid lays out immediately
+        placeholder_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+        )
+        placeholder_box.set_size_request(120, 80)
+        ph_spinner = Gtk.Spinner()
+        ph_spinner.start()
+        placeholder_box.append(ph_spinner)
+        self._flowbox.append(placeholder_box)
+
+        # Let the UI frame finish before loading the pixbuf
+        GLib.timeout_add(0, self._finish_thumbnail, path, placeholder_box)
+        return True
+
+    def _finish_thumbnail(self, path, placeholder_box):
+        pixbuf = make_thumbnail(path)
+        if not pixbuf:
+            self._flowbox.remove(placeholder_box)
+            return False
+
+        texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+        pic = Gtk.Picture.new_for_paintable(texture)
+        pic.set_content_fit(Gtk.ContentFit.FILL)
+        pic.set_size_request(120, 80)
+
+        overlay = Gtk.Overlay()
+        overlay.set_child(pic)
+
+        check = Gtk.Image(icon_name='object-select-symbolic', pixel_size=24)
+        check.set_opacity(0.0)
+        check.set_halign(Gtk.Align.END)
+        check.set_valign(Gtk.Align.START)
+        check.set_margin_top(4)
+        check.set_margin_end(4)
+        overlay.add_overlay(check)
+
+        btn = Gtk.Button(css_classes=['wallpaper-button', 'flat'])
+        btn.set_child(overlay)
+        btn.connect('clicked', self._on_wallpaper_clicked, path)
+
+        # Find the placeholder's position and replace it in-place
+        for i in range(200):
+            fc = self._flowbox.get_child_at_index(i)
+            if fc is None:
+                self._flowbox.remove(placeholder_box)
+                self._flowbox.append(btn)
+                break
+            if fc.get_child() == placeholder_box:
+                self._flowbox.insert(btn, i)
+                self._flowbox.remove(placeholder_box)
+                break
+
+        uri = 'file://' + path
+        self._wallpaper_btns[uri] = (btn, check, pic)
+        return False
+
+    def _add_custom_button_to_flowbox(self):
+        if self._pending_custom_btn:
+            return
+        custom_btn = Gtk.Button(label='Scegli un file…')
+        custom_btn.set_halign(Gtk.Align.CENTER)
+        custom_btn.set_valign(Gtk.Align.CENTER)
+        custom_btn.add_css_class('flat')
+        custom_btn.connect('clicked', self._on_choose_custom)
+        self._flowbox.append(custom_btn)
+        self._pending_custom_btn = custom_btn
+
+    def _on_choose_custom(self, btn):
+        dialog = Gtk.FileChooserNative(
+            title='Scegli un immagine',
+            transient_for=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        filter_images = Gtk.FileFilter()
+        filter_images.set_name('Immagini')
+        filter_images.add_mime_type('image/jpeg')
+        filter_images.add_mime_type('image/png')
+        filter_images.add_mime_type('image/webp')
+        filter_images.add_mime_type('image/bmp')
+        filter_images.add_mime_type('image/tiff')
+        dialog.add_filter(filter_images)
+        dialog.connect('response', self._on_custom_file_response)
+        dialog.show()
+
+    def _on_custom_file_response(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            file = dialog.get_file()
+            if file:
+                self._set_background(file.get_uri())
+        dialog.destroy()
+
+    def _on_monitor_toggled(self, btn, connector):
+        if btn.get_active():
+            self._selected_connector = connector
+            self._update_selection_indicators()
+
+    def _on_apply_all_toggled(self, switch, pspec):
+        self._apply_all = switch.get_active()
+        if self._apply_all:
+            for btn in self._monitor_btns:
+                btn.set_sensitive(False)
+        else:
+            for btn in self._monitor_btns:
+                btn.set_sensitive(True)
+        self._update_selection_indicators()
+
+    def _set_background(self, uri):
+        if self._apply_all:
+            for connector, _ in self._connectors:
+                if uri:
+                    self._settings[connector] = uri
+                else:
+                    self._settings.pop(connector, None)
+        else:
+            if uri:
+                self._settings[self._selected_connector] = uri
+            else:
+                self._settings.pop(self._selected_connector, None)
+        set_per_monitor_settings(self._settings)
+        self._update_selection_indicators()
+
+    def _on_wallpaper_clicked(self, btn, path):
+        uri = 'file://' + path
+        self._set_background(uri)
+
+    def _update_selection_indicators(self):
+        for uri, (btn, check, pic) in self._wallpaper_btns.items():
+            visible = False
+            if self._apply_all:
+                if any(self._settings.get(c) == uri for c, _ in self._connectors):
+                    visible = True
+            else:
+                if self._settings.get(self._selected_connector) == uri:
+                    visible = True
+            check.set_opacity(1.0 if visible else 0.0)
+
+
+def main():
+    if '--debug' in sys.argv:
+        connectors = get_monitor_connectors()
+        print(f'Monitors: {connectors}')
+        settings = get_per_monitor_settings()
+        print(f'Settings: {settings}')
+        return
+
+    app = PerMonitorBackgroundApp()
+    app.run(sys.argv)
+
+
+if __name__ == '__main__':
+    main()

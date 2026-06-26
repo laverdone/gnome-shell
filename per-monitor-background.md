@@ -114,3 +114,5 @@ gsettings reset org.gnome.shell per-monitor-background
 - Wallpapers are stored as file:// URIs with a `a{ss}` GSettings variant
   (string → string dictionary keyed by connector name).
 - The implementation is a proof‑of‑concept patch; it has not been upstreamed.
+
+![Configuration Tool](per%20monitor%20wallpaper/images/overview.png)
