@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="gnome-shell">
+  <schema id="org.gnome.shell.per-monitor" path="/org/gnome/shell/per-monitor/">
+    
+    <key name="per-monitor-background" type="a{ss}">
+      <default>{}</default>
+      <summary>Per-monitor wallpaper mapping for Light Mode</summary>
+      <description>
+        A dictionary mapping monitor connectors (e.g., 'DP-1', 'HDMI-1') to 
+        their respective background image URIs for the Light/Default style.
+      </description>
+    </key>
+
+    <key name="per-monitor-background-dark" type="a{ss}">
+      <default>{}</default>
+      <summary>Per-monitor wallpaper mapping for Dark Mode</summary>
+      <description>
+        A dictionary mapping monitor connectors (e.g., 'DP-1', 'HDMI-1') to 
+        their respective background image URIs for the Dark style.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

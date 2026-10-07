@@ -117,9 +117,11 @@ const PICTURE_URI_KEY = 'picture-uri';
 const PICTURE_URI_DARK_KEY = 'picture-uri-dark';
 
 const INTERFACE_SCHEMA = 'org.gnome.desktop.interface';
-const SHELL_SCHEMA = 'org.gnome.shell';
-const P_SCHEMA = 'org.gnome.shell.per-monitor';
 const COLOR_SCHEME_KEY = 'color-scheme';
+
+const PER_MONITOR_SCHEMA = 'org.gnome.shell.per-monitor';
+const PER_MONITOR_BACKGROUND_KEY = 'per-monitor-background';
+const PER_MONITOR_BACKGROUND_DARK_KEY = 'per-monitor-background-dark';
 
 export const FADE_ANIMATION_TIME = 1000;
 
@@ -149,6 +151,23 @@ class BackgroundCache extends Signals.EventEmitter {
         this._fileMonitors = {};
         this._backgroundSources = {};
         this._animations = {};
+        this._monitorsChangedId = 0;
+    }
+
+    _ensureMonitorsChangedHandler() {
+        if (this._monitorsChangedId)
+            return;
+
+        const monitorManager = global.backend.get_monitor_manager();
+        // Run before layout.js recreates BackgroundManagers so stale cache
+        // entries are never handed to new actors after hotplug.
+        this._monitorsChangedId = monitorManager.connect(
+            'monitors-changed', () => {
+                for (const settingsSchema in this._backgroundSources) {
+                    const source = this._backgroundSources[settingsSchema];
+                    source._invalidateAllBackgrounds();
+                }
+            });
     }
 
     monitorFile(file) {
@@ -169,6 +188,11 @@ class BackgroundCache extends Signals.EventEmitter {
         this._fileMonitors[key] = monitor;
     }
 
+    _animationCacheKey(settingsSchema, file) {
+        const uri = file?.get_uri?.() ?? '';
+        return `${settingsSchema}::${uri}`;
+    }
+
     getAnimation(params) {
         params = Params.parse(params, {
             file: null,
@@ -176,11 +200,14 @@ class BackgroundCache extends Signals.EventEmitter {
             onLoaded: null,
         });
 
-        let animation = this._animations[params.settingsSchema];
+        // Key by schema + file URI so distinct animated wallpapers on
+        // different monitors do not clobber each other in the cache.
+        const cacheKey = this._animationCacheKey(params.settingsSchema, params.file);
+        let animation = this._animations[cacheKey];
         if (animation && _fileEqual0(animation.file, params.file)) {
             if (params.onLoaded) {
                 const id = GLib.idle_add_once(GLib.PRIORITY_DEFAULT, () => {
-                    params.onLoaded(this._animations[params.settingsSchema]);
+                    params.onLoaded(this._animations[cacheKey]);
                 });
                 GLib.Source.set_name_by_id(id, '[gnome-shell] params.onLoaded');
             }
@@ -190,11 +217,11 @@ class BackgroundCache extends Signals.EventEmitter {
         animation = new Animation({file: params.file});
 
         animation.load_async(null, () => {
-            this._animations[params.settingsSchema] = animation;
+            this._animations[cacheKey] = animation;
 
             if (params.onLoaded) {
                 const id = GLib.idle_add_once(GLib.PRIORITY_DEFAULT, () => {
-                    params.onLoaded(this._animations[params.settingsSchema]);
+                    params.onLoaded(this._animations[cacheKey]);
                 });
                 GLib.Source.set_name_by_id(id, '[gnome-shell] params.onLoaded');
             }
@@ -204,6 +231,8 @@ class BackgroundCache extends Signals.EventEmitter {
     getBackgroundSource(layoutManager, settingsSchema) {
         // The layoutManager is always the same one; we pass in it since
         // Main.layoutManager may not be set yet
+
+        this._ensureMonitorsChangedHandler();
 
         if (!(settingsSchema in this._backgroundSources)) {
             this._backgroundSources[settingsSchema] = new BackgroundSource(layoutManager, settingsSchema);
@@ -520,7 +549,7 @@ const Background = GObject.registerClass({
             return;
         }
 
-        this._loadFile(this._file);
+        this._loadFile(this._file).catch(logError);
     }
 });
 
@@ -556,98 +585,219 @@ class BackgroundSource {
         this._settings = new Gio.Settings({schema_id: settingsSchema});
         this._backgrounds = [];
         this._backgroundConnectors = {};
-
-        const monitorManager = global.backend.get_monitor_manager();
-        this._monitorsChangedId =
-            monitorManager.connect('monitors-changed',
-                this._onMonitorsChanged.bind(this));
+        this._perMonitorMaps = {light: {}, dark: {}};
+        this._perMonSettings = null;
+        this._perMonId = 0;
 
         this._interfaceSettings = new Gio.Settings({schema_id: INTERFACE_SCHEMA});
 
-        const ps = new Gio.Settings({schema_id: P_SCHEMA});
-        this._perMonSettings = ps;
-        this._perMonId = ps.connect('changed', this._onPerMonitorBackgroundChanged.bind(this));
-    }
-
-    _onPerMonitorBackgroundChanged() {
-        for (const bg of Object.values(this._backgrounds)) {
-            if (bg)
-                bg._emitChangedSignal();
+        try {
+            this._perMonSettings = new Gio.Settings({schema_id: PER_MONITOR_SCHEMA});
+            this._refreshPerMonitorMaps();
+            this._perMonId = this._perMonSettings.connect(
+                'changed', this._onPerMonitorBackgroundChanged.bind(this));
+        } catch (e) {
+            console.warn(`Per-monitor background schema unavailable: ${e.message}`);
         }
     }
 
+    _discardCachedBackground(monitorIndex, notify) {
+        const background = this._backgrounds[monitorIndex];
+        if (!background)
+            return;
+
+        if (notify)
+            background.emit('bg-changed');
+
+        background.disconnect(background._changedId);
+        background.destroy();
+        delete this._backgrounds[monitorIndex];
+        if (monitorIndex >= 0)
+            delete this._backgroundConnectors[monitorIndex];
+    }
+
+    /**
+     * Drop every cached Background on monitor topology changes.
+     * Monitor indices are not stable across USB hub hotplug, so index-only
+     * cache keys are unsafe. Notify existing managers synchronously so
+     * overview workspaces refresh as well as the desktop.
+     */
+    _invalidateAllBackgrounds() {
+        const cached = this._backgrounds;
+        this._backgrounds = [];
+        this._backgroundConnectors = {};
+
+        for (const monitorIndex in cached) {
+            const background = cached[monitorIndex];
+            if (!background)
+                continue;
+
+            background.disconnect(background._changedId);
+            background.emit('bg-changed');
+            GLib.idle_add_once(GLib.PRIORITY_DEFAULT, () => {
+                background.destroy();
+            });
+        }
+    }
+
+    _isCachedPerMonitorBackgroundValid(monitorIndex, connector, uri) {
+        if (!(monitorIndex in this._backgrounds))
+            return false;
+
+        if (this._backgroundConnectors[monitorIndex] !== connector)
+            return false;
+
+        const background = this._backgrounds[monitorIndex];
+        const cachedUri = background._file?.get_uri?.() ?? null;
+        return cachedUri === uri;
+    }
+
+    _unpackPerMonitorMap(key) {
+        try {
+            const map = this._perMonSettings.get_value(key)?.recursiveUnpack();
+            return map && typeof map === 'object' ? map : {};
+        } catch {
+            return {};
+        }
+    }
+
+    _refreshPerMonitorMaps() {
+        if (!this._perMonSettings)
+            return;
+
+        this._perMonitorMaps = {
+            light: this._unpackPerMonitorMap(PER_MONITOR_BACKGROUND_KEY),
+            dark: this._unpackPerMonitorMap(PER_MONITOR_BACKGROUND_DARK_KEY),
+        };
+    }
+
+    _lookupPerMonitorUri(maps, connector) {
+        if (!connector || !maps)
+            return null;
+
+        const isDark = this._interfaceSettings.get_enum(COLOR_SCHEME_KEY) ===
+            GDesktopEnums.ColorScheme.PREFER_DARK;
+
+        if (isDark && connector in maps.dark)
+            return maps.dark[connector];
+
+        if (connector in maps.light)
+            return maps.light[connector];
+
+        return null;
+    }
+
+    _isUsableWallpaperUri(uri) {
+        if (!uri || typeof uri !== 'string')
+            return false;
+
+        try {
+            const file = Gio.File.new_for_commandline_arg(uri);
+            return file.query_exists(null);
+        } catch (e) {
+            console.warn(`Invalid per-monitor wallpaper URI '${uri}': ${e.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Pick a stable physical connector for a logical monitor index.
+     * Prefer the primary active output (tiled/MST), then any active
+     * output, then the first physical monitor.
+     */
     _getMonitorConnector(monitorIndex) {
         try {
-            const lm = global.backend.get_monitor_manager().get_logical_monitors();
-            const m = lm.find(l => l.get_number() === monitorIndex)?.get_monitors();
-            return m && m.length > 0 ? m[0].get_connector() : null;
-        } catch { return null; }
+            const logicalMonitors =
+                global.backend.get_monitor_manager().get_logical_monitors();
+            const logical = logicalMonitors.find(
+                lm => lm.get_number() === monitorIndex);
+            if (!logical)
+                return null;
+
+            const physicals = logical.get_monitors();
+            if (!physicals || physicals.length === 0)
+                return null;
+
+            const primary = physicals.find(m => m.is_primary() && m.is_active());
+            if (primary)
+                return primary.get_connector();
+
+            const active = physicals.find(m => m.is_active());
+            if (active)
+                return active.get_connector();
+
+            return physicals[0].get_connector();
+        } catch {
+            return null;
+        }
     }
 
     _getPerMonitorUri(monitorIndex) {
-        try {
-            const isDark = this._interfaceSettings.get_enum('color-scheme') === GDesktopEnums.ColorScheme.PREFER_DARK;
-            const s = new Gio.Settings({schema_id: P_SCHEMA});
-            const keys = isDark
-                ? ['per-monitor-background-dark', 'per-monitor-background']
-                : ['per-monitor-background'];
-            for (const k of keys) {
-                const d = s.get_value(k)?.recursiveUnpack();
-                if (!d || typeof d !== 'object')
-                    continue;
-                const c = this._getMonitorConnector(monitorIndex);
-                if (c && c in d)
-                    return d[c];
-            }
+        if (!this._perMonSettings)
             return null;
-        } catch { return null; }
-    }
 
-    _onMonitorsChanged() {
-        const nMonitors = this._layoutManager.monitors.length;
-        let sharedChanged = false;
+        const connector = this._getMonitorConnector(monitorIndex);
+        const uri = this._lookupPerMonitorUri(this._perMonitorMaps, connector);
+        if (!uri)
+            return null;
 
-        for (const monitorIndex in this._backgrounds) {
-            const index = parseInt(monitorIndex, 10);
-            if (index < 0)
-                continue;
-
-            const background = this._backgrounds[monitorIndex];
-
-            if (index >= nMonitors) {
-                background.disconnect(background._changedId);
-                background.destroy();
-                delete this._backgrounds[monitorIndex];
-                delete this._backgroundConnectors[monitorIndex];
-                continue;
-            }
-
-            const connector = this._getMonitorConnector(index);
-            if (connector == null)
-                continue;
-
-            const oldConnector = this._backgroundConnectors[monitorIndex];
-            if (connector !== oldConnector) {
-                background.disconnect(background._changedId);
-                background.destroy();
-                delete this._backgrounds[monitorIndex];
-                delete this._backgroundConnectors[monitorIndex];
-                sharedChanged = true;
-                continue;
-            }
-
-            background.updateResolution();
+        if (!this._isUsableWallpaperUri(uri)) {
+            console.warn(
+                `Per-monitor wallpaper for ${connector} missing or unreadable: ${uri}`);
+            return null;
         }
 
-        if (sharedChanged && this._backgrounds[-1])
+        return uri;
+    }
+
+    _onPerMonitorBackgroundChanged(_settings, key) {
+        if (key &&
+            key !== PER_MONITOR_BACKGROUND_KEY &&
+            key !== PER_MONITOR_BACKGROUND_DARK_KEY)
+            return;
+
+        const oldMaps = {
+            light: {...this._perMonitorMaps.light},
+            dark: {...this._perMonitorMaps.dark},
+        };
+        this._refreshPerMonitorMaps();
+
+        let sharedNeedsRefresh = false;
+        const nMonitors = this._layoutManager.monitors.length;
+
+        for (let i = 0; i < nMonitors; i++) {
+            const connector = this._getMonitorConnector(i);
+            const oldUri = this._lookupPerMonitorUri(oldMaps, connector);
+            const newUri = this._lookupPerMonitorUri(this._perMonitorMaps, connector);
+            if (oldUri === newUri)
+                continue;
+
+            const dedicated = this._backgrounds[i];
+            if (dedicated) {
+                dedicated._emitChangedSignal();
+            } else {
+                // Monitor was using the shared background; force managers
+                // attached to it to recreate so they pick up the override.
+                sharedNeedsRefresh = true;
+            }
+        }
+
+        if (sharedNeedsRefresh && this._backgrounds[-1])
             this._backgrounds[-1]._emitChangedSignal();
     }
 
     getBackground(monitorIndex) {
+        // We don't watch changes to settings here,
+        // instead we rely on Background to watch those
+        // and emit 'bg-changed' at the right time
+
         const perMonitorUri = this._getPerMonitorUri(monitorIndex);
         if (perMonitorUri) {
+            const connector = this._getMonitorConnector(monitorIndex);
+            if (!this._isCachedPerMonitorBackgroundValid(monitorIndex, connector, perMonitorUri))
+                this._discardCachedBackground(monitorIndex, false);
+
             if (!(monitorIndex in this._backgrounds)) {
-                const connector = this._getMonitorConnector(monitorIndex);
                 if (connector)
                     this._backgroundConnectors[monitorIndex] = connector;
 
@@ -674,6 +824,11 @@ class BackgroundSource {
             return this._backgrounds[monitorIndex];
         }
 
+        // Monitor no longer has a per-monitor override; drop a dedicated entry
+        // that may still be cached under this index from before hotplug.
+        if (monitorIndex in this._backgrounds)
+            this._discardCachedBackground(monitorIndex, false);
+
         let file = null;
         let style;
 
@@ -693,17 +848,19 @@ class BackgroundSource {
             }
         }
 
-        // Use a reserved key (-1) for the shared background
-        // This prevents conflict with per-monitor backgrounds
-        // that may use the same numeric index
+        // Animated backgrounds are (potentially) per-monitor, since
+        // they can have variants that depend on the aspect ratio and
+        // size of the monitor; for other backgrounds we can use the
+        // same background object for all monitors.
+        // Use -1 as the shared slot so it never collides with monitor 0
+        // when that monitor has a dedicated per-monitor wallpaper.
         const sharedIndex = -1;
-
         if (file == null || !file.get_basename().endsWith('.xml'))
             monitorIndex = sharedIndex;
 
         if (!(monitorIndex in this._backgrounds)) {
             const background = new Background({
-                monitorIndex,
+                monitorIndex: monitorIndex < 0 ? 0 : monitorIndex,
                 layoutManager: this._layoutManager,
                 settings: this._settings,
                 file,
@@ -723,8 +880,11 @@ class BackgroundSource {
     }
 
     destroy() {
-        const monitorManager = global.backend.get_monitor_manager();
-        monitorManager.disconnect(this._monitorsChangedId);
+        if (this._perMonSettings && this._perMonId) {
+            this._perMonSettings.disconnect(this._perMonId);
+            this._perMonId = 0;
+        }
+        this._perMonSettings = null;
 
         for (const monitorIndex in this._backgrounds) {
             const background = this._backgrounds[monitorIndex];
@@ -733,6 +893,8 @@ class BackgroundSource {
         }
 
         this._backgrounds = null;
+        this._backgroundConnectors = null;
+        this._perMonitorMaps = null;
     }
 }
 
@@ -930,85 +1092,4 @@ export class BackgroundManager extends Signals.EventEmitter {
 
         return backgroundActor;
     }
-}
-
-/**
- * Get the current per-monitor background configuration.
- *
- * @returns {Object} A dictionary mapping monitor connector names to URIs
- */
-export function getPerMonitorBackgrounds() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = settings.get_value('per-monitor-background');
-    return variant ? variant.recursiveUnpack() : {};
-}
-
-/**
- * Get the current per-monitor background configuration for the dark scheme.
- *
- * @returns {Object} A dictionary mapping monitor connector names to URIs
- */
-export function getPerMonitorBackgroundsDark() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = settings.get_value('per-monitor-background-dark');
-    return variant ? variant.recursiveUnpack() : {};
-}
-
-/**
- * Set a per-monitor background for the given connector.
- * Accepts both file:// URIs and plain file paths.
- *
- * @param {string} connector - The monitor connector name (e.g. "DP-1", "eDP-1")
- * @param {string} uriOrPath - The background image URI or file path
- */
-export function setPerMonitorBackground(connector, uriOrPath) {
-    const uri = uriOrPath.startsWith('file://') || uriOrPath.startsWith('http')
-        ? uriOrPath
-        : Gio.File.new_for_path(uriOrPath).get_uri();
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const dict = getPerMonitorBackgrounds();
-    dict[connector] = uri;
-    const variant = new GLib.Variant('a{ss}', dict);
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Clear the per-monitor background override for the given connector.
- *
- * @param {string} connector - The monitor connector name
- */
-export function clearPerMonitorBackground(connector) {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const dict = getPerMonitorBackgrounds();
-    delete dict[connector];
-    const variant = new GLib.Variant('a{ss}', dict);
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Clear all per-monitor background overrides.
- */
-export function clearAllPerMonitorBackgrounds() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = new GLib.Variant('a{ss}', {});
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Get a list of all connected monitors with their connector names.
- *
- * @returns {Array<{index: number, connector: string, displayName: string}>}
- */
-export function getMonitorConnectors() {
-    const monitorManager = global.backend.get_monitor_manager();
-    const logicalMonitors = monitorManager.get_logical_monitors();
-    return logicalMonitors.map(lm => {
-        const monitors = lm.get_monitors();
-        const monitor = monitors && monitors.length > 0 ? monitors[0] : null;
-        return {
-            index: lm.get_number(),
-            connector: monitor ? monitor.get_connector() : null,
-            displayName: monitor ? monitor.get_display_name() : null,
-        };
-    }).filter(m => m.connector);
 }

@@ -10,6 +10,7 @@ gi.require_version('Gio', '2.0')
 gi.require_version('GLib', '2.0')
 gi.require_version('GObject', '2.0')
 gi.require_version('GdkPixbuf', '2.0')
+gi.require_version('Gdk', '4.0')
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 
@@ -19,6 +20,7 @@ WALLPAPER_DIRS = [
     '/usr/share/backgrounds',
     os.path.expanduser('~/.local/share/backgrounds'),
     os.path.expanduser('~/Immagini/Sfondi'),
+    os.path.expanduser('~/Immagini/wallpaper'),
     os.path.expanduser('~/Pictures/Wallpapers'),
 ]
 
@@ -55,10 +57,11 @@ def get_monitor_connectors():
         return []
 
 
-def get_per_monitor_settings():
+def get_per_monitor_settings(dark=False):
+    key = 'per-monitor-background-dark' if dark else 'per-monitor-background'
     try:
-        settings = Gio.Settings.new('org.gnome.shell')
-        variant = settings.get_value('per-monitor-background')
+        settings = Gio.Settings.new('org.gnome.shell.per-monitor')
+        variant = settings.get_value(key)
         if variant:
             return variant.unpack()
         return {}
@@ -67,11 +70,22 @@ def get_per_monitor_settings():
         return {}
 
 
-def set_per_monitor_settings(settings_dict):
+def set_per_monitor_settings(settings_dict, dark=False):
+    key = 'per-monitor-background-dark' if dark else 'per-monitor-background'
     try:
-        settings = Gio.Settings.new('org.gnome.shell')
-        variant = GLib.Variant('a{ss}', settings_dict)
-        settings.set_value('per-monitor-background', variant)
+        # Drop empty / missing file URIs before writing.
+        cleaned = {}
+        for connector, uri in settings_dict.items():
+            if not connector or not uri:
+                continue
+            path = urlparse(uri).path if uri.startswith('file:') else uri
+            if path and not os.path.isfile(path):
+                print(f'Skipping missing wallpaper for {connector}: {uri}', file=sys.stderr)
+                continue
+            cleaned[connector] = uri
+        settings = Gio.Settings.new('org.gnome.shell.per-monitor')
+        variant = GLib.Variant('a{ss}', cleaned)
+        settings.set_value(key, variant)
         settings.sync()
     except Exception as e:
         print(f'Error writing settings: {e}', file=sys.stderr)
@@ -127,6 +141,7 @@ class PerMonitorBackgroundApp(Adw.Application):
         )
 
     def do_activate(self):
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
         win = PerMonitorBackgroundWindow(self)
         win.present()
 
@@ -141,7 +156,10 @@ class PerMonitorBackgroundWindow(Adw.ApplicationWindow):
         )
 
         self._connectors = get_monitor_connectors()
-        self._settings = get_per_monitor_settings()
+        self._light_settings = get_per_monitor_settings(False)
+        self._dark_settings = get_per_monitor_settings(True)
+        self._dark_mode = False
+        self._settings = self._light_settings
         self._selected_connector = self._connectors[0][0] if self._connectors else None
         self._multi_monitor = len(self._connectors) > 1
         self._apply_all = False
@@ -232,6 +250,27 @@ class PerMonitorBackgroundWindow(Adw.ApplicationWindow):
         switch_row.connect('notify::active', self._on_apply_all_toggled)
         display_group.add(switch_row)
         self._apply_all_switch = switch_row
+
+        scheme_row = Adw.ComboRow(
+            title='Schema colore',
+            subtitle='Scegli lo schema per cui impostare gli sfondi',
+            model=Gtk.StringList.new(['Chiaro', 'Scuro']),
+            selected=0,
+        )
+        scheme_row.connect('notify::selected', self._on_scheme_changed)
+        display_group.add(scheme_row)
+        self._scheme_row = scheme_row
+
+        clear_row = Adw.ActionRow(
+            title='Rimuovi override',
+            subtitle='Torna allo sfondo globale GNOME per il display selezionato',
+        )
+        clear_btn = Gtk.Button(label='Rimuovi', valign=Gtk.Align.CENTER)
+        clear_btn.add_css_class('destructive-action')
+        clear_btn.connect('clicked', self._on_clear_override)
+        clear_row.add_suffix(clear_btn)
+        clear_row.set_activatable_widget(clear_btn)
+        display_group.add(clear_row)
 
         page.add(display_group)
 
@@ -426,12 +465,20 @@ class PerMonitorBackgroundWindow(Adw.ApplicationWindow):
                 self._settings[self._selected_connector] = uri
             else:
                 self._settings.pop(self._selected_connector, None)
-        set_per_monitor_settings(self._settings)
+        set_per_monitor_settings(self._settings, self._dark_mode)
+        self._update_selection_indicators()
+
+    def _on_scheme_changed(self, row, pspec):
+        self._dark_mode = row.get_selected() == 1
+        self._settings = self._dark_settings if self._dark_mode else self._light_settings
         self._update_selection_indicators()
 
     def _on_wallpaper_clicked(self, btn, path):
         uri = 'file://' + path
         self._set_background(uri)
+
+    def _on_clear_override(self, btn):
+        self._set_background(None)
 
     def _update_selection_indicators(self):
         for uri, (btn, check, pic) in self._wallpaper_btns.items():
@@ -449,8 +496,10 @@ def main():
     if '--debug' in sys.argv:
         connectors = get_monitor_connectors()
         print(f'Monitors: {connectors}')
-        settings = get_per_monitor_settings()
-        print(f'Settings: {settings}')
+        light = get_per_monitor_settings(False)
+        dark = get_per_monitor_settings(True)
+        print(f'Light settings: {light}')
+        print(f'Dark settings: {dark}')
         return
 
     app = PerMonitorBackgroundApp()

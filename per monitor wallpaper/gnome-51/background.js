@@ -10,14 +10,9 @@
 //   (This is separate from the fading for an animated background,
 //   since using two actors is quite inefficient.)
 //
-// MetaBackgroundImage
-//   An object represented an image file that will be used for drawing
-//   the background. MetaBackgroundImage objects asynchronously load,
-//   so they are first created in an unloaded state, then later emit
-//   a ::loaded signal when the Cogl object becomes available.
-//
-// MetaBackgroundImageCache
-//   A cache from filename to MetaBackgroundImage.
+// BackgroundTextureCache
+//   Shell-side cache from filename to CoglTexture. Handles image loading
+//   using glycin, creates textures, and manages GL video memory purge events.
 //
 // BackgroundSource
 //   An object that is created for each GSettings schema (separate
@@ -26,11 +21,12 @@
 //
 // MetaBackground
 //   Holds the specification of a background - a background color
-//   or gradient and one or two images blended together.
+//   or gradient and one or two textures blended together.
 //
 // Background
-//   JS delegate object that Connects a MetaBackground to the GSettings
-//   schema for the background.
+//   JS delegate object that connects a MetaBackground to the GSettings
+//   schema for the background. Loads images via BackgroundTextureCache
+//   and provides textures to MetaBackground.
 //
 // Animation
 //   A helper object that handles loading a XML-based animation; it is a
@@ -59,14 +55,14 @@
 //         \               |               /
 //          `------- MetaBackground ------'
 //                         |
-//                MetaBackgroundImage            looked up in MetaBackgroundImageCache
+//                   CoglTexture                 looked up in BackgroundTextureCache
 //
-// The animated case is tricker because the animation XML file can specify different
+// The animated case is trickier because the animation XML file can specify different
 // files for different monitor resolutions and aspect ratios. For this reason,
-// the BackgroundSource provides different Background share a single Animation object,
-// which tracks the animation, but use different MetaBackground objects. In the
-// common case, the different MetaBackground objects will be created for the
-// same filename and look up the *same* MetaBackgroundImage object, so there is
+// the BackgroundSource provides different Background objects that share a single
+// Animation object, which tracks the animation, but use different MetaBackground
+// objects. In the common case, the different MetaBackground objects will be created
+// for the same filename and look up the *same* CoglTexture object, so there is
 // little wasted memory:
 //
 // BackgroundManager               BackgroundManager
@@ -80,16 +76,16 @@
 //         \      |                |       /
 //      MetaBackground           MetaBackground
 //                 \                 /
-//                MetaBackgroundImage            looked up in MetaBackgroundImageCache
-//                MetaBackgroundImage
+//                   CoglTexture                 looked up in BackgroundTextureCache
+//                   CoglTexture
 //
 // But the case of different filenames and different background images
 // is possible as well:
 //                        ....
 //      MetaBackground              MetaBackground
 //             |                          |
-//     MetaBackgroundImage         MetaBackgroundImage
-//     MetaBackgroundImage         MetaBackgroundImage
+//        CoglTexture                CoglTexture
+//        CoglTexture                CoglTexture
 
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
@@ -97,6 +93,7 @@ import GDesktopEnums from 'gi://GDesktopEnums';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Glycin from 'gi://Gly';
 import GnomeBG from 'gi://GnomeBG';
 import GnomeDesktop from 'gi://GnomeDesktop';
 import Meta from 'gi://Meta';
@@ -117,8 +114,6 @@ const PICTURE_URI_KEY = 'picture-uri';
 const PICTURE_URI_DARK_KEY = 'picture-uri-dark';
 
 const INTERFACE_SCHEMA = 'org.gnome.desktop.interface';
-const SHELL_SCHEMA = 'org.gnome.shell';
-const P_SCHEMA = 'org.gnome.shell.per-monitor';
 const COLOR_SCHEME_KEY = 'color-scheme';
 
 export const FADE_ANIMATION_TIME = 1000;
@@ -131,6 +126,7 @@ const ANIMATION_OPACITY_STEP_INCREMENT = 4.0;
 const ANIMATION_MIN_WAKEUP_INTERVAL = 1.0;
 
 let _backgroundCache = null;
+let _backgroundTextureCache = null;
 
 function _fileEqual0(file1, file2) {
     if (file1 === file2)
@@ -234,6 +230,160 @@ function getBackgroundCache() {
     if (!_backgroundCache)
         _backgroundCache = new BackgroundCache();
     return _backgroundCache;
+}
+
+class BackgroundTextureCache {
+    constructor() {
+        this._textures = new Map(); // uri -> {texture, colorState}
+    }
+
+    async load(file, cancellable) {
+        const uri = file.get_uri();
+
+        if (this._textures.has(uri))
+            return this._textures.get(uri);
+
+        // Load image using glycin
+        const [frameData, colorState] = await this._loadGlycinFrame(file, cancellable);
+
+        // Create CoglTexture from glycin frame data
+        const texture = this._createTexture(frameData);
+
+        const entry = {texture, colorState};
+        this._textures.set(uri, entry);
+        return entry;
+    }
+
+    async _loadGlycinFrame(file, cancellable) {
+        const stream = await file.read_async(GLib.PRIORITY_DEFAULT, cancellable);
+        const loader = Glycin.Loader.new_for_stream(stream);
+
+        loader.set_accepted_memory_formats(
+            Glycin.MemoryFormatSelection.B8G8R8A8_PREMULTIPLIED |
+            Glycin.MemoryFormatSelection.A8R8G8B8_PREMULTIPLIED |
+            Glycin.MemoryFormatSelection.R8G8B8A8_PREMULTIPLIED |
+            Glycin.MemoryFormatSelection.B8G8R8A8 |
+            Glycin.MemoryFormatSelection.A8R8G8B8 |
+            Glycin.MemoryFormatSelection.R8G8B8A8 |
+            Glycin.MemoryFormatSelection.A8B8G8R8 |
+            Glycin.MemoryFormatSelection.R8G8B8 |
+            Glycin.MemoryFormatSelection.B8G8R8 |
+            Glycin.MemoryFormatSelection.R16G16B16A16_PREMULTIPLIED |
+            Glycin.MemoryFormatSelection.R16G16B16A16 |
+            Glycin.MemoryFormatSelection.R16G16B16A16_FLOAT |
+            Glycin.MemoryFormatSelection.R32G32B32A32_FLOAT_PREMULTIPLIED |
+            Glycin.MemoryFormatSelection.R32G32B32A32_FLOAT
+        );
+
+        const image = loader.load();
+        const frame = image.next_frame();
+
+        const width = frame.get_width();
+        const height = frame.get_height();
+        const stride = frame.get_stride();
+        const bytes = frame.get_buf_bytes();
+        const format = frame.get_memory_format();
+        const cicp = frame.get_color_cicp();
+
+        let colorState = null;
+        if (cicp) {
+            const clutterCicp = new Clutter.Cicp({
+                primaries: cicp.color_primaries,
+                transfer: cicp.transfer_characteristics,
+                matrix_coefficients: cicp.matrix_coefficients,
+                video_full_range_flag: cicp.video_full_range_flag,
+            });
+
+            try {
+                const clutterContext = global.stage.context;
+                colorState = Clutter.ColorStateParams.new_from_cicp(clutterContext, clutterCicp);
+            } catch (e) {
+                logError(e, 'Failed to create color state from CICP');
+            }
+        }
+
+        return [{width, height, stride, bytes, format}, colorState];
+    }
+
+    _glyMemoryFormatToCogl(format) {
+        switch (format) {
+        case Glycin.MemoryFormat.B8G8R8A8_PREMULTIPLIED:
+            return Cogl.PixelFormat.BGRA_8888_PRE;
+        case Glycin.MemoryFormat.A8R8G8B8_PREMULTIPLIED:
+            return Cogl.PixelFormat.ARGB_8888_PRE;
+        case Glycin.MemoryFormat.R8G8B8A8_PREMULTIPLIED:
+            return Cogl.PixelFormat.RGBA_8888_PRE;
+        case Glycin.MemoryFormat.B8G8R8A8:
+            return Cogl.PixelFormat.BGRA_8888;
+        case Glycin.MemoryFormat.A8R8G8B8:
+            return Cogl.PixelFormat.ARGB_8888;
+        case Glycin.MemoryFormat.R8G8B8A8:
+            return Cogl.PixelFormat.RGBA_8888;
+        case Glycin.MemoryFormat.A8B8G8R8:
+            return Cogl.PixelFormat.ABGR_8888;
+        case Glycin.MemoryFormat.R8G8B8:
+            return Cogl.PixelFormat.RGB_888;
+        case Glycin.MemoryFormat.B8G8R8:
+            return Cogl.PixelFormat.BGR_888;
+        case Glycin.MemoryFormat.R16G16B16A16_PREMULTIPLIED:
+            return Cogl.PixelFormat.RGBA_16161616_PRE;
+        case Glycin.MemoryFormat.R16G16B16A16:
+            return Cogl.PixelFormat.RGBA_16161616;
+        case Glycin.MemoryFormat.R16G16B16A16_FLOAT:
+            return Cogl.PixelFormat.RGBA_FP_16161616;
+        case Glycin.MemoryFormat.R32G32B32A32_FLOAT_PREMULTIPLIED:
+            return Cogl.PixelFormat.RGBA_FP_32323232_PRE;
+        case Glycin.MemoryFormat.R32G32B32A32_FLOAT:
+            return Cogl.PixelFormat.RGBA_FP_32323232;
+        default:
+            throw new Error(`Unsupported glycin memory format: ${format}`);
+        }
+    }
+
+    _createTexture(frameData) {
+        const {width, height, stride, bytes, format} = frameData;
+
+        const coglFormat = this._glyMemoryFormatToCogl(format);
+        const data = bytes.get_data();
+        const clutterContext = global.stage.context;
+        const clutterBackend = clutterContext.get_backend();
+        const ctx = clutterBackend.get_cogl_context();
+
+        const hasAlpha = Glycin.memory_format_has_alpha(format);
+        const components = hasAlpha
+            ? Cogl.TextureComponents.RGBA
+            : Cogl.TextureComponents.RGB;
+
+        let texture = Cogl.Texture2D.new_with_size(ctx, width, height);
+        texture.set_components(components);
+
+        // Try to allocate
+        // if it fails (texture too large), use sliced
+        try {
+            texture.allocate();
+        } catch {
+            texture = Cogl.Texture2DSliced.new_with_size(ctx, width, height, Cogl.TEXTURE_MAX_WASTE);
+            texture.set_components(components);
+        }
+
+        if (!texture.set_data(coglFormat, stride, data, 0))
+            throw new Error('Failed to set texture data');
+
+        return texture;
+    }
+
+    purge(file) {
+        this._textures.delete(file.get_uri());
+    }
+}
+
+/**
+ * @returns {BackgroundTextureCache}
+ */
+function getBackgroundTextureCache() {
+    if (!_backgroundTextureCache)
+        _backgroundTextureCache = new BackgroundTextureCache();
+    return _backgroundTextureCache;
 }
 
 const Background = GObject.registerClass({
@@ -371,8 +521,8 @@ const Background = GObject.registerClass({
         const signalId = this._cache.connect('file-changed',
             (cache, changedFile) => {
                 if (changedFile.equal(file)) {
-                    const imageCache = Meta.BackgroundImageCache.get_default();
-                    imageCache.purge(changedFile);
+                    const textureCache = getBackgroundTextureCache();
+                    textureCache.purge(changedFile);
                     this._emitChangedSignal();
                 }
             });
@@ -386,44 +536,50 @@ const Background = GObject.registerClass({
         }
     }
 
-    _updateAnimation() {
+    async _updateAnimation() {
         this._updateAnimationTimeoutId = 0;
 
         this._animation.update(this._layoutManager.monitors[this._monitorIndex]);
         const files = this._animation.keyFrameFiles;
 
-        const finish = () => {
+        if (files.length === 0) {
+            this.set_file(null, this._style);
             this._setLoaded();
-            if (files.length > 1) {
-                this.set_blend(files[0], files[1],
-                    this._animation.transitionProgress,
-                    this._style);
-            } else if (files.length > 0) {
-                this.set_file(files[0], this._style);
-            } else {
-                this.set_file(null, this._style);
-            }
             this._queueUpdateAnimation();
-        };
+            return;
+        }
 
-        const cache = Meta.BackgroundImageCache.get_default();
-        let numPendingImages = files.length;
-        for (let i = 0; i < files.length; i++) {
-            this._watchFile(files[i]);
-            const image = cache.load(files[i]);
-            if (image.is_loaded()) {
-                numPendingImages--;
-                if (numPendingImages === 0)
-                    finish();
-            } else {
-                // eslint-disable-next-line no-loop-func
-                const id = image.connect('loaded', () => {
-                    image.disconnect(id);
-                    numPendingImages--;
-                    if (numPendingImages === 0)
-                        finish();
-                });
+        const cache = getBackgroundTextureCache();
+
+        try {
+            const entries = await Promise.all(
+                files.map(f => {
+                    this._watchFile(f);
+                    return cache.load(f, this._cancellable);
+                })
+            );
+
+            const textures = entries.map(e => e.texture);
+            const colorState = entries[0]?.colorState || null;
+
+            if (textures.length > 1) {
+                this.set_blend_textures(
+                    textures[0],
+                    textures[1],
+                    this._animation.transitionProgress,
+                    this._style,
+                    colorState
+                );
+            } else if (textures.length > 0) {
+                this.set_texture(textures[0], this._style, colorState);
             }
+
+            this._setLoaded();
+            this._queueUpdateAnimation();
+        } catch (err) {
+            if (!err.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                logError(err, 'Failed to load animation');
+            this._setLoaded();
         }
     }
 
@@ -474,19 +630,19 @@ const Background = GObject.registerClass({
         });
     }
 
-    _loadImage(file) {
-        this.set_file(file, this._style);
+    async _loadImage(file) {
         this._watchFile(file);
 
-        const cache = Meta.BackgroundImageCache.get_default();
-        const image = cache.load(file);
-        if (image.is_loaded()) {
+        const cache = getBackgroundTextureCache();
+
+        try {
+            const {texture, colorState} = await cache.load(file, this._cancellable);
+            this.set_texture(texture, this._style, colorState);
             this._setLoaded();
-        } else {
-            const id = image.connect('loaded', () => {
-                this._setLoaded();
-                image.disconnect(id);
-            });
+        } catch (err) {
+            if (!err.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                logError(err, 'Failed to load background');
+            this._setLoaded();
         }
     }
 
@@ -507,7 +663,7 @@ const Background = GObject.registerClass({
         if (contentType === 'application/xml')
             this._loadAnimation(file);
         else
-            this._loadImage(file);
+            await this._loadImage(file);
     }
 
     _load() {
@@ -520,7 +676,7 @@ const Background = GObject.registerClass({
             return;
         }
 
-        this._loadFile(this._file);
+        this._loadFile(this._file).catch(logError);
     }
 });
 
@@ -555,7 +711,6 @@ class BackgroundSource {
         this._overrideImage = GLib.getenv('SHELL_BACKGROUND_IMAGE');
         this._settings = new Gio.Settings({schema_id: settingsSchema});
         this._backgrounds = [];
-        this._backgroundConnectors = {};
 
         const monitorManager = global.backend.get_monitor_manager();
         this._monitorsChangedId =
@@ -563,119 +718,29 @@ class BackgroundSource {
                 this._onMonitorsChanged.bind(this));
 
         this._interfaceSettings = new Gio.Settings({schema_id: INTERFACE_SCHEMA});
-
-        const ps = new Gio.Settings({schema_id: P_SCHEMA});
-        this._perMonSettings = ps;
-        this._perMonId = ps.connect('changed', this._onPerMonitorBackgroundChanged.bind(this));
-    }
-
-    _onPerMonitorBackgroundChanged() {
-        for (const bg of Object.values(this._backgrounds)) {
-            if (bg)
-                bg._emitChangedSignal();
-        }
-    }
-
-    _getMonitorConnector(monitorIndex) {
-        try {
-            const lm = global.backend.get_monitor_manager().get_logical_monitors();
-            const m = lm.find(l => l.get_number() === monitorIndex)?.get_monitors();
-            return m && m.length > 0 ? m[0].get_connector() : null;
-        } catch { return null; }
-    }
-
-    _getPerMonitorUri(monitorIndex) {
-        try {
-            const isDark = this._interfaceSettings.get_enum('color-scheme') === GDesktopEnums.ColorScheme.PREFER_DARK;
-            const s = new Gio.Settings({schema_id: P_SCHEMA});
-            const keys = isDark
-                ? ['per-monitor-background-dark', 'per-monitor-background']
-                : ['per-monitor-background'];
-            for (const k of keys) {
-                const d = s.get_value(k)?.recursiveUnpack();
-                if (!d || typeof d !== 'object')
-                    continue;
-                const c = this._getMonitorConnector(monitorIndex);
-                if (c && c in d)
-                    return d[c];
-            }
-            return null;
-        } catch { return null; }
     }
 
     _onMonitorsChanged() {
-        const nMonitors = this._layoutManager.monitors.length;
-        let sharedChanged = false;
-
         for (const monitorIndex in this._backgrounds) {
-            const index = parseInt(monitorIndex, 10);
-            if (index < 0)
-                continue;
-
             const background = this._backgrounds[monitorIndex];
 
-            if (index >= nMonitors) {
+            if (monitorIndex < this._layoutManager.monitors.length) {
+                background.updateResolution();
+            } else {
                 background.disconnect(background._changedId);
                 background.destroy();
                 delete this._backgrounds[monitorIndex];
-                delete this._backgroundConnectors[monitorIndex];
-                continue;
             }
-
-            const connector = this._getMonitorConnector(index);
-            if (connector == null)
-                continue;
-
-            const oldConnector = this._backgroundConnectors[monitorIndex];
-            if (connector !== oldConnector) {
-                background.disconnect(background._changedId);
-                background.destroy();
-                delete this._backgrounds[monitorIndex];
-                delete this._backgroundConnectors[monitorIndex];
-                sharedChanged = true;
-                continue;
-            }
-
-            background.updateResolution();
         }
-
-        if (sharedChanged && this._backgrounds[-1])
-            this._backgrounds[-1]._emitChangedSignal();
     }
 
     getBackground(monitorIndex) {
-        const perMonitorUri = this._getPerMonitorUri(monitorIndex);
-        if (perMonitorUri) {
-            if (!(monitorIndex in this._backgrounds)) {
-                const connector = this._getMonitorConnector(monitorIndex);
-                if (connector)
-                    this._backgroundConnectors[monitorIndex] = connector;
-
-                const background = new Background({
-                    monitorIndex,
-                    layoutManager: this._layoutManager,
-                    settings: this._settings,
-                    file: Gio.File.new_for_commandline_arg(perMonitorUri),
-                    style: this._settings.get_enum(BACKGROUND_STYLE_KEY),
-                });
-
-                background._changedId = background.connect('bg-changed', () => {
-                    background.disconnect(background._changedId);
-                    background.destroy();
-                    delete this._backgrounds[monitorIndex];
-                    delete this._backgroundConnectors[monitorIndex];
-                });
-
-                this._backgrounds[monitorIndex] = background;
-
-                if (this._backgrounds[-1])
-                    this._backgrounds[-1]._emitChangedSignal();
-            }
-            return this._backgrounds[monitorIndex];
-        }
-
         let file = null;
         let style;
+
+        // We don't watch changes to settings here,
+        // instead we rely on Background to watch those
+        // and emit 'bg-changed' at the right time
 
         if (this._overrideImage != null) {
             file = Gio.File.new_for_path(this._overrideImage);
@@ -693,13 +758,12 @@ class BackgroundSource {
             }
         }
 
-        // Use a reserved key (-1) for the shared background
-        // This prevents conflict with per-monitor backgrounds
-        // that may use the same numeric index
-        const sharedIndex = -1;
-
+        // Animated backgrounds are (potentially) per-monitor, since
+        // they can have variants that depend on the aspect ratio and
+        // size of the monitor; for other backgrounds we can use the
+        // same background object for all monitors.
         if (file == null || !file.get_basename().endsWith('.xml'))
-            monitorIndex = sharedIndex;
+            monitorIndex = 0;
 
         if (!(monitorIndex in this._backgrounds)) {
             const background = new Background({
@@ -930,85 +994,4 @@ export class BackgroundManager extends Signals.EventEmitter {
 
         return backgroundActor;
     }
-}
-
-/**
- * Get the current per-monitor background configuration.
- *
- * @returns {Object} A dictionary mapping monitor connector names to URIs
- */
-export function getPerMonitorBackgrounds() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = settings.get_value('per-monitor-background');
-    return variant ? variant.recursiveUnpack() : {};
-}
-
-/**
- * Get the current per-monitor background configuration for the dark scheme.
- *
- * @returns {Object} A dictionary mapping monitor connector names to URIs
- */
-export function getPerMonitorBackgroundsDark() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = settings.get_value('per-monitor-background-dark');
-    return variant ? variant.recursiveUnpack() : {};
-}
-
-/**
- * Set a per-monitor background for the given connector.
- * Accepts both file:// URIs and plain file paths.
- *
- * @param {string} connector - The monitor connector name (e.g. "DP-1", "eDP-1")
- * @param {string} uriOrPath - The background image URI or file path
- */
-export function setPerMonitorBackground(connector, uriOrPath) {
-    const uri = uriOrPath.startsWith('file://') || uriOrPath.startsWith('http')
-        ? uriOrPath
-        : Gio.File.new_for_path(uriOrPath).get_uri();
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const dict = getPerMonitorBackgrounds();
-    dict[connector] = uri;
-    const variant = new GLib.Variant('a{ss}', dict);
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Clear the per-monitor background override for the given connector.
- *
- * @param {string} connector - The monitor connector name
- */
-export function clearPerMonitorBackground(connector) {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const dict = getPerMonitorBackgrounds();
-    delete dict[connector];
-    const variant = new GLib.Variant('a{ss}', dict);
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Clear all per-monitor background overrides.
- */
-export function clearAllPerMonitorBackgrounds() {
-    const settings = new Gio.Settings({schema_id: P_SCHEMA});
-    const variant = new GLib.Variant('a{ss}', {});
-    settings.set_value('per-monitor-background', variant);
-}
-
-/**
- * Get a list of all connected monitors with their connector names.
- *
- * @returns {Array<{index: number, connector: string, displayName: string}>}
- */
-export function getMonitorConnectors() {
-    const monitorManager = global.backend.get_monitor_manager();
-    const logicalMonitors = monitorManager.get_logical_monitors();
-    return logicalMonitors.map(lm => {
-        const monitors = lm.get_monitors();
-        const monitor = monitors && monitors.length > 0 ? monitors[0] : null;
-        return {
-            index: lm.get_number(),
-            connector: monitor ? monitor.get_connector() : null,
-            displayName: monitor ? monitor.get_display_name() : null,
-        };
-    }).filter(m => m.connector);
 }
